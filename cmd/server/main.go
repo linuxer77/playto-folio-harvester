@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,9 +16,23 @@ import (
 	"playto-folio-harvester/internal/db"
 	"playto-folio-harvester/internal/repository"
 	"playto-folio-harvester/internal/worker"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
+
+	if err := godotenv.Load(); err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("env_file_load_skipped file=.env reason=not_found")
+		} else {
+			log.Printf("env_file_load_skipped file=.env error=%q", err)
+		}
+	} else {
+		log.Printf("env_file_loaded file=.env")
+	}
+
 	databaseURL := os.Getenv("DATABASE_URL")
 	port := envOrDefault("PORT", "8080")
 	pythonExecutable := envOrDefault("PYTHON_BIN", "python")
@@ -28,6 +43,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("resolve worker script path: %v", err)
 	}
+
+	log.Printf(
+		"service_starting port=%s python_bin=%q worker_script=%q output_base=%q database=%s",
+		port,
+		pythonExecutable,
+		resolvedWorkerScriptPath,
+		filepath.Clean(outputBaseDir),
+		redactDatabaseURL(databaseURL),
+	)
 
 	ctx := context.Background()
 	pool, err := db.NewPool(ctx, databaseURL)
@@ -70,7 +94,10 @@ func main() {
 
 	if err := server.Shutdown(gracefulCtx); err != nil {
 		log.Printf("server shutdown error: %v", err)
+		return
 	}
+
+	log.Printf("server_shutdown_complete")
 }
 
 func envOrDefault(key, fallback string) string {
@@ -79,4 +106,26 @@ func envOrDefault(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func redactDatabaseURL(databaseURL string) string {
+	if databaseURL == "" {
+		return "<empty>"
+	}
+
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		return "<invalid>"
+	}
+
+	if parsed.User != nil {
+		username := parsed.User.Username()
+		if username != "" {
+			parsed.User = url.UserPassword(username, "***")
+		} else {
+			parsed.User = url.User("***")
+		}
+	}
+
+	return parsed.String()
 }

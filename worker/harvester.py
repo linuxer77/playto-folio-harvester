@@ -7,7 +7,10 @@ import argparse
 import asyncio
 import json
 import mimetypes
+import os
 import re
+import sys
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +51,11 @@ def log(event: str, **fields: object) -> None:
     print(f"[{stamp}] {event}", flush=True)
 
 
+def log_exception(event: str, exc: BaseException, **fields: object) -> None:
+    trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    log(event, error_type=type(exc).__name__, error=str(exc), traceback=trace, **fields)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Portfolio media harvester worker")
     parser.add_argument("--url", required=True, help="Candidate portfolio URL")
@@ -56,7 +64,15 @@ def parse_args() -> argparse.Namespace:
         default="./temp_harvest",
         help="Directory where harvested files are saved (default: ./temp_harvest)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    log(
+        "args_parsed",
+        url=args.url,
+        output=args.output,
+        cwd=os.getcwd(),
+        python_executable=sys.executable,
+    )
+    return args
 
 
 def is_pdf_url(url: str) -> bool:
@@ -121,7 +137,18 @@ def infer_extension(url: str, content_type: str, default_ext: str) -> str:
 async def ensure_fully_rendered(page: Page, url: str) -> None:
     log("navigation_start", url=url)
     await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-    await page.wait_for_load_state("networkidle", timeout=45_000)
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=45_000)
+    except PlaywrightTimeoutError:
+        # Some sites keep long-lived background requests open indefinitely.
+        log(
+            "navigation_networkidle_timeout",
+            timeout_ms=45_000,
+            current_url=page.url,
+        )
+        await page.wait_for_selector("body", state="attached", timeout=10_000)
+        await page.wait_for_timeout(1_500)
 
     # Scroll to trigger lazy-loaded images/videos on modern portfolio pages.
     for _ in range(8):
@@ -139,7 +166,7 @@ async def ensure_fully_rendered(page: Page, url: str) -> None:
 
 async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str]]:
     dom_snapshot = await page.evaluate(
-        """
+        r"""
         () => {
             const values = {
                 images: new Set(),
@@ -328,7 +355,7 @@ async def download_url(
             log("download_complete", source=url, saved_as=destination.name)
             return destination
     except Exception as exc:  # noqa: BLE001 - resilience for unreliable web sources
-        log("download_error", source=url, error=str(exc))
+        log("download_error", source=url, error_type=type(exc).__name__, error=str(exc))
         return None
 
 
@@ -351,7 +378,7 @@ async def download_assets(
                     with Image.open(path) as image:
                         width, height = image.size
                 except Exception as exc:  # noqa: BLE001 - skip unreadable images
-                    log("image_dimension_check_error", file=path.name, error=str(exc))
+                    log("image_dimension_check_error", file=path.name, error_type=type(exc).__name__, error=str(exc))
                     path.unlink(missing_ok=True)
                     continue
 
@@ -457,13 +484,13 @@ async def extract_videos(
             video_files.extend(downloaded)
             log("video_download_complete", source=video_url, files=[path.name for path in downloaded])
         except DownloadError as exc:
-            log("video_download_failed", source=video_url, error=str(exc))
+            log("video_download_failed", source=video_url, error_type=type(exc).__name__, error=str(exc))
             screenshot = await capture_video_fallback_screenshot(page, output_dir, index)
             if screenshot:
                 fallback_images.append(screenshot)
             fallbacks.append(FallbackEntry(source_url=video_url, reason=str(exc), screenshot_path=screenshot))
         except Exception as exc:  # noqa: BLE001 - must degrade gracefully
-            log("video_download_failed", source=video_url, error=str(exc))
+            log("video_download_failed", source=video_url, error_type=type(exc).__name__, error=str(exc))
             screenshot = await capture_video_fallback_screenshot(page, output_dir, index)
             if screenshot:
                 fallback_images.append(screenshot)
@@ -494,7 +521,7 @@ def sanitize_images(image_paths: Iterable[Path]) -> list[Path]:
             log("image_sanitized", file=image_path.name)
             sanitized.append(image_path)
         except Exception as exc:  # noqa: BLE001 - continue processing remaining files
-            log("image_sanitization_error", file=image_path.name, error=str(exc))
+            log("image_sanitization_error", file=image_path.name, error_type=type(exc).__name__, error=str(exc))
             sanitized.append(image_path)
 
     return sanitized
@@ -562,7 +589,9 @@ async def run_harvest(url: str, output_dir: Path) -> None:
     fallback_entries: list[FallbackEntry] = []
 
     async with async_playwright() as playwright:
+        log("browser_launch_start", browser="chromium", headless=True)
         browser = await playwright.chromium.launch(headless=True)
+        log("browser_launch_complete", browser="chromium")
         context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1600, "height": 900})
         page = await context.new_page()
 
@@ -573,11 +602,12 @@ async def run_harvest(url: str, output_dir: Path) -> None:
             video_files, fallback_entries, fallback_images = await extract_videos(page, video_urls, output_dir)
             image_files.extend(fallback_images)
         except PlaywrightTimeoutError as exc:
-            log("navigation_timeout", error=str(exc))
+            log_exception("navigation_timeout", exc, current_url=page.url)
             raise
         finally:
             await context.close()
             await browser.close()
+            log("browser_shutdown_complete")
 
     sanitized_images = sanitize_images(image_files)
     renamed_images, image_map = rename_generic(sanitized_images, "image")
@@ -609,7 +639,7 @@ def main() -> None:
         log("harvest_cancelled")
         raise SystemExit(130) from None
     except Exception as exc:  # noqa: BLE001 - top-level worker safety
-        log("harvest_failed", error=str(exc))
+        log_exception("harvest_failed", exc, url=args.url, output=str(output_dir))
         raise SystemExit(1) from exc
 
 

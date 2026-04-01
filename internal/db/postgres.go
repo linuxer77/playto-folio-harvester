@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -17,6 +18,14 @@ func NewPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("parse database config: %w", err)
 	}
 
+	log.Printf(
+		"db_connect_start host=%s port=%d database=%s user=%s",
+		cfg.ConnConfig.Host,
+		cfg.ConnConfig.Port,
+		cfg.ConnConfig.Database,
+		cfg.ConnConfig.User,
+	)
+
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
@@ -26,6 +35,8 @@ func NewPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
+
+	log.Printf("db_connect_success host=%s port=%d database=%s", cfg.ConnConfig.Host, cfg.ConnConfig.Port, cfg.ConnConfig.Database)
 
 	return pool, nil
 }
