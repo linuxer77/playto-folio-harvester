@@ -1,2 +1,51 @@
-*.json
-*.env
+# -----------------------------
+# Go
+# -----------------------------
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+coverage.out
+
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+.venv/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# -----------------------------
+# Node / Next.js (frontend)
+# -----------------------------
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.pnp.*
+frontend/.env.local
+frontend/.turbo/
+
+# -----------------------------
+# Project specific
+# -----------------------------
+temp_harvest/
+.env
+.env.*
+!.env.example
+service-account.json
+drive_link.txt
+
+# -----------------------------
+# OS / Editor / Logs
+# -----------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

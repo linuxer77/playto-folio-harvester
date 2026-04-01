@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"playto-folio-harvester/internal/models"
 
@@ -29,7 +30,23 @@ func NewPostgresJobRepository(pool *pgxpool.Pool) *PostgresJobRepository {
 	return &PostgresJobRepository{pool: pool}
 }
 
+const optionalFieldDefaultValue = "N/A"
+
+func normalizeOptionalField(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return optionalFieldDefaultValue
+	}
+
+	return trimmed
+}
+
 func (r *PostgresJobRepository) CreateJob(ctx context.Context, input models.CreateJobInput) (models.Job, error) {
+	clientName := normalizeOptionalField(input.ClientName)
+	jobTitle := normalizeOptionalField(input.JobTitle)
+	candidateName := normalizeOptionalField(input.CandidateName)
+	portfolioURL := strings.TrimSpace(input.PortfolioURL)
+
 	query := `
 		INSERT INTO jobs (client_name, job_title, candidate_name, portfolio_url, status)
 		VALUES ($1, $2, $3, $4, $5)
@@ -39,10 +56,10 @@ func (r *PostgresJobRepository) CreateJob(ctx context.Context, input models.Crea
 	row := r.pool.QueryRow(
 		ctx,
 		query,
-		input.ClientName,
-		input.JobTitle,
-		input.CandidateName,
-		input.PortfolioURL,
+		clientName,
+		jobTitle,
+		candidateName,
+		portfolioURL,
 		models.JobStatusQueued,
 	)
 

@@ -128,15 +128,6 @@ func (h *JobHandler) getJobByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateCreateJobRequest(req createJobRequest) error {
-	if strings.TrimSpace(req.ClientName) == "" {
-		return fmt.Errorf("client_name is required")
-	}
-	if strings.TrimSpace(req.JobTitle) == "" {
-		return fmt.Errorf("job_title is required")
-	}
-	if strings.TrimSpace(req.CandidateName) == "" {
-		return fmt.Errorf("candidate_name is required")
-	}
 	if strings.TrimSpace(req.PortfolioURL) == "" {
 		return fmt.Errorf("portfolio_url is required")
 	}
