@@ -26,7 +26,9 @@ USER_AGENT = (
 )
 VIDEO_HOST_PATTERN = re.compile(r"(youtube\.com|youtu\.be|vimeo\.com)", re.IGNORECASE)
 DIRECT_VIDEO_PATTERN = re.compile(r"\.(mp4|m4v|mov|webm)(?:$|\?|#)", re.IGNORECASE)
+DRIVE_FILE_PATTERN = re.compile(r"drive\.google\.com/file/d/", re.IGNORECASE)
 VIDEO_FILE_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi"}
+MIN_IMAGE_DIMENSION = 250
 
 
 @dataclass
@@ -64,6 +66,23 @@ def is_pdf_url(url: str) -> bool:
 def is_video_candidate(url: str) -> bool:
     lowered = url.lower()
     return bool(VIDEO_HOST_PATTERN.search(lowered) or DIRECT_VIDEO_PATTERN.search(lowered))
+
+
+def normalize_drive_file_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+
+    if "drive.google.com" not in parsed.netloc.lower() or not DRIVE_FILE_PATTERN.search(url):
+        return None
+
+    match = re.search(r"/file/d/([^/]+)", parsed.path)
+    if not match:
+        return None
+
+    file_id = match.group(1)
+    canonical_path = f"/file/d/{file_id}/view"
+    return parsed._replace(path=canonical_path, fragment="").geturl()
 
 
 def normalize_url(base_url: str, raw_value: str | None) -> str | None:
@@ -127,6 +146,9 @@ async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str]]:
                 links: new Set(),
                 iframes: new Set(),
                 videos: new Set(),
+                driveLinks: new Set(),
+                driveIframes: new Set(),
+                skippedLogoImages: [],
             };
 
             const push = (targetSet, raw) => {
@@ -139,23 +161,55 @@ async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str]]:
                 }
             };
 
+            const hasLogoKeyword = (raw) => typeof raw === "string" && /(logo|icon|favicon)/i.test(raw);
+            const isDriveFileLink = (raw) => typeof raw === "string" && /drive\.google\.com\/file\/d\//i.test(raw);
+
             document.querySelectorAll("img").forEach((img) => {
-                push(values.images, img.currentSrc);
-                push(values.images, img.getAttribute("src"));
-                push(values.images, img.getAttribute("data-src"));
-                push(values.images, img.getAttribute("data-lazy-src"));
+                const candidateSources = new Set();
+                push(candidateSources, img.currentSrc);
+                push(candidateSources, img.getAttribute("src"));
+                push(candidateSources, img.getAttribute("data-src"));
+                push(candidateSources, img.getAttribute("data-lazy-src"));
+
                 const srcset = img.getAttribute("srcset") || img.getAttribute("data-srcset") || "";
                 srcset.split(",").forEach((entry) => {
-                    push(values.images, entry.trim().split(/\\s+/)[0]);
+                    push(candidateSources, entry.trim().split(/\\s+/)[0]);
+                });
+
+                const srcValue = img.currentSrc || img.getAttribute("src") || "";
+                const altValue = img.getAttribute("alt") || "";
+                const classValue = img.getAttribute("class") || "";
+                const idValue = img.getAttribute("id") || "";
+
+                if ([srcValue, altValue, classValue, idValue].some(hasLogoKeyword)) {
+                    values.skippedLogoImages.push({
+                        src: srcValue,
+                        alt: altValue,
+                        className: classValue,
+                        id: idValue,
+                    });
+                    return;
+                }
+
+                candidateSources.forEach((source) => {
+                    push(values.images, source);
                 });
             });
 
             document.querySelectorAll("a[href]").forEach((anchor) => {
-                push(values.links, anchor.getAttribute("href"));
+                const href = anchor.getAttribute("href");
+                push(values.links, href);
+                if (isDriveFileLink(href)) {
+                    push(values.driveLinks, href);
+                }
             });
 
             document.querySelectorAll("iframe[src]").forEach((frame) => {
-                push(values.iframes, frame.getAttribute("src"));
+                const src = frame.getAttribute("src");
+                push(values.iframes, src);
+                if (isDriveFileLink(src)) {
+                    push(values.driveIframes, src);
+                }
             });
 
             document.querySelectorAll("video").forEach((video) => {
@@ -170,6 +224,9 @@ async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str]]:
                 links: [...values.links],
                 iframes: [...values.iframes],
                 videos: [...values.videos],
+                drive_links: [...values.driveLinks],
+                drive_iframes: [...values.driveIframes],
+                skipped_logo_images: values.skippedLogoImages,
             };
         }
         """
@@ -180,6 +237,15 @@ async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str]]:
     image_urls: set[str] = set()
     pdf_urls: set[str] = set()
     video_urls: set[str] = set()
+
+    for skipped_logo in dom_snapshot.get("skipped_logo_images", []):
+        log(
+            "logo_image_skipped",
+            src=skipped_logo.get("src", ""),
+            alt=skipped_logo.get("alt", ""),
+            class_name=skipped_logo.get("className", ""),
+            element_id=skipped_logo.get("id", ""),
+        )
 
     for raw in dom_snapshot.get("images", []):
         normalized = normalize_url(base_url, raw)
@@ -204,6 +270,30 @@ async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str]]:
         normalized = normalize_url(base_url, raw)
         if normalized and is_video_candidate(normalized):
             video_urls.add(normalized)
+
+    for raw in dom_snapshot.get("drive_links", []):
+        normalized = normalize_url(base_url, raw)
+        if not normalized:
+            continue
+
+        drive_url = normalize_drive_file_url(normalized)
+        if not drive_url:
+            continue
+
+        video_urls.add(drive_url)
+        log("drive_link_detected", source=drive_url)
+
+    for raw in dom_snapshot.get("drive_iframes", []):
+        normalized = normalize_url(base_url, raw)
+        if not normalized:
+            continue
+
+        drive_url = normalize_drive_file_url(normalized)
+        if not drive_url:
+            continue
+
+        video_urls.add(drive_url)
+        log("drive_iframe_detected", source=drive_url)
 
     log(
         "media_discovered",
@@ -257,6 +347,25 @@ async def download_assets(
         for index, image_url in enumerate(sorted(set(image_urls)), start=1):
             path = await download_url(session, image_url, output_dir, f"raw_image_{index:03d}", ".jpg")
             if path:
+                try:
+                    with Image.open(path) as image:
+                        width, height = image.size
+                except Exception as exc:  # noqa: BLE001 - skip unreadable images
+                    log("image_dimension_check_error", file=path.name, error=str(exc))
+                    path.unlink(missing_ok=True)
+                    continue
+
+                if width < MIN_IMAGE_DIMENSION or height < MIN_IMAGE_DIMENSION:
+                    log(
+                        "image_small_skipped",
+                        file=path.name,
+                        width=width,
+                        height=height,
+                        min_size=MIN_IMAGE_DIMENSION,
+                    )
+                    path.unlink(missing_ok=True)
+                    continue
+
                 image_files.append(path)
 
         for index, pdf_url in enumerate(sorted(set(pdf_urls)), start=1):
