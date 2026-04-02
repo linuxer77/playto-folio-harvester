@@ -19,7 +19,13 @@ type JobRepository interface {
 	CreateJob(ctx context.Context, input models.CreateJobInput) (models.Job, error)
 	ListJobs(ctx context.Context) ([]models.Job, error)
 	GetJobByID(ctx context.Context, id uuid.UUID) (models.Job, error)
-	UpdateJobStatus(ctx context.Context, id uuid.UUID, status models.JobStatus, errorLogs *string) error
+	UpdateJobStatus(
+		ctx context.Context,
+		id uuid.UUID,
+		status models.JobStatus,
+		driveLink *string,
+		errorLogs *string,
+	) error
 }
 
 type PostgresJobRepository struct {
@@ -133,16 +139,18 @@ func (r *PostgresJobRepository) UpdateJobStatus(
 	ctx context.Context,
 	id uuid.UUID,
 	status models.JobStatus,
+	driveLink *string,
 	errorLogs *string,
 ) error {
 	query := `
 		UPDATE jobs
 		SET status = $2,
-			error_logs = $3
+			drive_link = $3,
+			error_logs = $4
 		WHERE id = $1
 	`
 
-	result, err := r.pool.Exec(ctx, query, id, status, errorLogs)
+	result, err := r.pool.Exec(ctx, query, id, status, driveLink, errorLogs)
 	if err != nil {
 		return fmt.Errorf("update job status: %w", err)
 	}

@@ -40,6 +40,7 @@ temp_harvest/
 !.env.example
 service-account.json
 drive_link.txt
+*.json
 
 # -----------------------------
 # OS / Editor / Logs

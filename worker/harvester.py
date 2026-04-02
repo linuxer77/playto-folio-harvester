@@ -18,6 +18,9 @@ from typing import Iterable
 from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 from PIL import Image
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 from yt_dlp import DownloadError, YoutubeDL
@@ -32,6 +35,9 @@ DIRECT_VIDEO_PATTERN = re.compile(r"\.(mp4|m4v|mov|webm)(?:$|\?|#)", re.IGNORECA
 DRIVE_FILE_PATTERN = re.compile(r"drive\.google\.com/file/d/", re.IGNORECASE)
 VIDEO_FILE_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi"}
 MIN_IMAGE_DIMENSION = 250
+MAX_VIDEO_HEIGHT = 1080
+MAX_VIDEO_FILESIZE_BYTES = 200 * 1024 * 1024
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 @dataclass
@@ -59,6 +65,7 @@ def log_exception(event: str, exc: BaseException, **fields: object) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Portfolio media harvester worker")
     parser.add_argument("--url", required=True, help="Candidate portfolio URL")
+    parser.add_argument("--job-id", default="", help="Job ID used for Drive upload folder naming")
     parser.add_argument(
         "--output",
         default="./temp_harvest",
@@ -68,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     log(
         "args_parsed",
         url=args.url,
+        job_id=args.job_id,
         output=args.output,
         cwd=os.getcwd(),
         python_executable=sys.executable,
@@ -408,13 +416,29 @@ def _download_video_sync(video_url: str, output_dir: Path, ordinal: int) -> list
     prefix = f"raw_video_{ordinal:03d}"
     template = str(output_dir / f"{prefix}.%(ext)s")
 
+    class YTDLPLogger:
+        def debug(self, message: str) -> None:  # noqa: D401 - yt-dlp logger interface
+            _ = message
+
+        def warning(self, message: str) -> None:  # noqa: D401 - yt-dlp logger interface
+            _ = message
+
+        def error(self, message: str) -> None:  # noqa: D401 - yt-dlp logger interface
+            _ = message
+
     options = {
-        "format": "bestvideo*+bestaudio/best",
+        "format": (
+            f"bestvideo*[height<={MAX_VIDEO_HEIGHT}]"
+            f"+bestaudio/best[height<={MAX_VIDEO_HEIGHT}]"
+            f"/best[height<={MAX_VIDEO_HEIGHT}]"
+        ),
         "merge_output_format": "mp4",
+        "max_filesize": MAX_VIDEO_FILESIZE_BYTES,
         "noplaylist": True,
         "outtmpl": template,
         "quiet": True,
         "no_warnings": True,
+        "logger": YTDLPLogger(),
         "ignoreerrors": False,
         "retries": 1,
     }
@@ -430,6 +454,14 @@ def _download_video_sync(video_url: str, output_dir: Path, ordinal: int) -> list
 
     if not produced_files:
         raise RuntimeError("yt-dlp completed without producing a local video file")
+
+    for produced_file in produced_files:
+        produced_size = produced_file.stat().st_size
+        if produced_size > MAX_VIDEO_FILESIZE_BYTES:
+            produced_file.unlink(missing_ok=True)
+            raise DownloadError(
+                f"video exceeded {MAX_VIDEO_FILESIZE_BYTES} byte limit: {produced_file.name}"
+            )
 
     return produced_files
 
@@ -510,7 +542,8 @@ def sanitize_images(image_paths: Iterable[Path]) -> list[Path]:
                 image_format = image.format or "PNG"
 
                 scrubbed = Image.new(image.mode, image.size)
-                scrubbed.putdata(image.getdata())
+                pixel_data = image.get_flattened_data() if hasattr(image, "get_flattened_data") else image.getdata()
+                scrubbed.putdata(pixel_data)
                 if image_format.upper() in {"JPEG", "JPG"} and scrubbed.mode not in {"RGB", "L"}:
                     scrubbed = scrubbed.convert("RGB")
 
@@ -579,7 +612,127 @@ def write_video_fallback_readme(output_dir: Path, fallback_entries: Iterable[Fal
     log("video_fallback_readme_created", file=readme_path.name, entries=len(entries))
 
 
-async def run_harvest(url: str, output_dir: Path) -> None:
+def resolve_service_account_path() -> Path:
+    from_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if from_env:
+        return Path(from_env).expanduser().resolve()
+
+    return (Path(__file__).resolve().parents[1] / "service-account.json").resolve()
+
+
+def upload_to_drive(output_dir: Path, job_id: str) -> str:
+    target_folder_id = os.getenv("DRIVE_TARGET_FOLDER_ID", "").strip()
+    if not target_folder_id:
+        raise RuntimeError("DRIVE_TARGET_FOLDER_ID is required for Drive upload")
+
+    credentials_path = resolve_service_account_path()
+    if not credentials_path.is_file():
+        raise FileNotFoundError(f"service account file not found: {credentials_path}")
+
+    credentials = service_account.Credentials.from_service_account_file(
+        str(credentials_path),
+        scopes=DRIVE_SCOPES,
+    )
+    drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+    target_folder = (
+        drive_service.files()
+        .get(
+            fileId=target_folder_id,
+            fields="id,name,mimeType,driveId,capabilities(canAddChildren)",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+
+    target_folder_name = str(target_folder.get("name", ""))
+    target_drive_id = str(target_folder.get("driveId", "")).strip()
+    target_capabilities = target_folder.get("capabilities") or {}
+    can_add_children = bool(target_capabilities.get("canAddChildren", False))
+
+    log(
+        "drive_target_folder_resolved",
+        folder_id=target_folder_id,
+        folder_name=target_folder_name,
+        drive_id=target_drive_id,
+        can_add_children=can_add_children,
+    )
+
+    if not can_add_children:
+        raise RuntimeError(
+            f"service account cannot add files to DRIVE_TARGET_FOLDER_ID={target_folder_id} "
+            f"({target_folder_name or 'unknown_name'})"
+        )
+
+    if not target_drive_id:
+        raise RuntimeError(
+            "DRIVE_TARGET_FOLDER_ID must point to a Shared Drive folder for service-account uploads; "
+            "current folder has no driveId (My Drive), which triggers storageQuotaExceeded"
+        )
+
+    folder_metadata = {
+        "name": f"Extraction_{job_id}",
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [target_folder_id],
+    }
+
+    folder_id: str | None = None
+    try:
+        created_folder = (
+            drive_service.files()
+            .create(body=folder_metadata, fields="id", supportsAllDrives=True)
+            .execute()
+        )
+        folder_id = str(created_folder["id"])
+
+        for candidate in sorted(output_dir.iterdir(), key=lambda path: path.name):
+            if not candidate.is_file():
+                continue
+            if candidate.name == "drive_link.txt":
+                continue
+
+            media = MediaFileUpload(str(candidate), resumable=False)
+            drive_service.files().create(
+                body={"name": candidate.name, "parents": [folder_id]},
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+
+        drive_service.permissions().create(
+            fileId=folder_id,
+            body={"type": "anyone", "role": "reader"},
+            supportsAllDrives=True,
+        ).execute()
+
+        folder_details = (
+            drive_service.files()
+            .get(fileId=folder_id, fields="webViewLink", supportsAllDrives=True)
+            .execute()
+        )
+        web_view_link = str(folder_details.get("webViewLink", "")).strip()
+        if not web_view_link:
+            raise RuntimeError("Google Drive did not return webViewLink for created folder")
+
+        drive_link_path = output_dir / "drive_link.txt"
+        drive_link_path.write_text(web_view_link + "\n", encoding="utf-8")
+        return web_view_link
+    except Exception:
+        if folder_id:
+            try:
+                drive_service.files().delete(fileId=folder_id, supportsAllDrives=True).execute()
+                log("drive_temp_folder_deleted", folder_id=folder_id)
+            except Exception as cleanup_exc:  # noqa: BLE001 - cleanup should not hide original error
+                log(
+                    "drive_temp_folder_delete_failed",
+                    folder_id=folder_id,
+                    error_type=type(cleanup_exc).__name__,
+                    error=str(cleanup_exc),
+                )
+        raise
+
+
+async def run_harvest(url: str, output_dir: Path, job_id: str) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     log("harvest_started", url=url, output=str(output_dir))
 
@@ -628,13 +781,17 @@ async def run_harvest(url: str, output_dir: Path) -> None:
         fallbacks=len(fallback_entries),
     )
 
+    drive_link = await asyncio.to_thread(upload_to_drive, output_dir, job_id)
+    log("drive_upload_completed", job_id=job_id, drive_link=drive_link)
+
 
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output).expanduser().resolve()
+    job_id = args.job_id.strip() or output_dir.name
 
     try:
-        asyncio.run(run_harvest(args.url, output_dir))
+        asyncio.run(run_harvest(args.url, output_dir, job_id))
     except KeyboardInterrupt:
         log("harvest_cancelled")
         raise SystemExit(130) from None

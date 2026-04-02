@@ -47,16 +47,18 @@ func (p *Processor) process(job models.Job) {
 
 	log.Printf("job=%s event=worker_start portfolio_url=%q", job.ID, job.PortfolioURL)
 
-	if err := p.jobs.UpdateJobStatus(ctx, job.ID, models.JobStatusInProgress, nil); err != nil {
+	if err := p.jobs.UpdateJobStatus(ctx, job.ID, models.JobStatusInProgress, nil, nil); err != nil {
 		log.Printf("job=%s update in_progress failed: %v", job.ID, err)
 		return
 	}
 	log.Printf("job=%s event=status_updated status=%s", job.ID, models.JobStatusInProgress)
 
 	outputDir := filepath.Join(p.outputBaseDir, job.ID.String())
+	defer os.RemoveAll(outputDir)
+
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		errMsg := fmt.Sprintf("create output directory: %v", err)
-		_ = p.jobs.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, &errMsg)
+		_ = p.jobs.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, nil, &errMsg)
 		log.Printf("job=%s %s", job.ID, errMsg)
 		return
 	}
@@ -65,6 +67,8 @@ func (p *Processor) process(job models.Job) {
 		ctx,
 		p.pythonExecutable,
 		p.workerScriptPath,
+		"--job-id",
+		job.ID.String(),
 		"--url",
 		job.PortfolioURL,
 		"--output",
@@ -91,7 +95,7 @@ func (p *Processor) process(job models.Job) {
 		errMsg := buildWorkerErrorMessage(err, stdoutText, stderrText)
 
 		errMsg = truncate(errMsg, 12_000)
-		if updateErr := p.jobs.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, &errMsg); updateErr != nil {
+		if updateErr := p.jobs.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, nil, &errMsg); updateErr != nil {
 			log.Printf("job=%s update failed status failed: %v", job.ID, updateErr)
 		}
 
@@ -107,16 +111,38 @@ func (p *Processor) process(job models.Job) {
 		return
 	}
 
-	if err := p.jobs.UpdateJobStatus(ctx, job.ID, models.JobStatusCompleted, nil); err != nil {
+	driveLinkPath := filepath.Join(outputDir, "drive_link.txt")
+	driveLinkContent, err := os.ReadFile(driveLinkPath)
+	if err != nil {
+		errMsg := truncate(fmt.Sprintf("read drive_link.txt: %v", err), 12_000)
+		if updateErr := p.jobs.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, nil, &errMsg); updateErr != nil {
+			log.Printf("job=%s update failed status failed: %v", job.ID, updateErr)
+		}
+		log.Printf("job=%s event=drive_link_read_failed error=%q", job.ID, err)
+		return
+	}
+
+	driveLink := strings.TrimSpace(string(driveLinkContent))
+	if driveLink == "" {
+		errMsg := "drive_link.txt is empty"
+		if updateErr := p.jobs.UpdateJobStatus(ctx, job.ID, models.JobStatusFailed, nil, &errMsg); updateErr != nil {
+			log.Printf("job=%s update failed status failed: %v", job.ID, updateErr)
+		}
+		log.Printf("job=%s event=drive_link_read_failed error=%q", job.ID, errMsg)
+		return
+	}
+
+	if err := p.jobs.UpdateJobStatus(ctx, job.ID, models.JobStatusCompleted, &driveLink, nil); err != nil {
 		log.Printf("job=%s update completed failed: %v", job.ID, err)
 		return
 	}
 
 	log.Printf(
-		"job=%s event=worker_completed status=%s duration=%s",
+		"job=%s event=worker_completed status=%s duration=%s drive_link=%q",
 		job.ID,
 		models.JobStatusCompleted,
 		time.Since(startedAt).Round(time.Millisecond),
+		driveLink,
 	)
 }
 
