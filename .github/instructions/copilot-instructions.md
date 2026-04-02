@@ -23,11 +23,11 @@ This is a decoupled system optimized for background processing.
     * Strips metadata from PDFs.
     * Visually redacts PII inside PDFs using `PyMuPDF`.
     * Renames all files to generic names (e.g., `image_01.jpg`, `video_01.mp4`).
-6.  **Export (Python):** Uploads the clean files to Google Drive using a Service Account, creates a shareable link, and updates the PostgreSQL job status to `completed` with the link.
+6.  **Export (Python):** Uploads the clean files to Google Drive using OAuth 2.0 Desktop credentials, creates a shareable link, and updates the PostgreSQL job status to `completed` with the link.
 7.  **Delivery:** The Next.js UI polls the Go API and displays the final Drive link to the operator.
 
 ## 4. Strict Engineering Constraints (DO NOT HALLUCINATE OR BYPASS)
-* **Google Drive Auth:** You MUST use the Google Drive API v3 with a Service Account JSON key. This runs entirely server-side. Do NOT implement OAuth flows that require human consent screens.
+* **Google Drive Auth:** Use Google Drive API v3 with OAuth 2.0 Desktop App flow (`oauth-secret.json` + persisted `token.json`) and automatic token refresh.
 * **PDF Redaction Rule:** Do NOT just extract and delete text from PDFs. You MUST use `PyMuPDF` (fitz) to find regex matches for emails/phone numbers, draw an opaque white rectangle over the coordinates, and FLATTEN the document.
 * **File Naming:** Never preserve original filenames. They often contain candidate names.
 * **Graceful Video Degradation:** If `yt-dlp` fails to download a video due to DRM, catch the error, take a screenshot of the video player, and write the URL to a `README.txt` file in the candidate's folder. Do not fail the entire job.

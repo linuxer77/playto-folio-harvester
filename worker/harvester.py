@@ -18,7 +18,9 @@ from typing import Iterable
 from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
-from google.oauth2 import service_account
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from PIL import Image
@@ -612,12 +614,88 @@ def write_video_fallback_readme(output_dir: Path, fallback_entries: Iterable[Fal
     log("video_fallback_readme_created", file=readme_path.name, entries=len(entries))
 
 
-def resolve_service_account_path() -> Path:
-    from_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+def resolve_oauth_client_secret_path() -> Path:
+    from_env = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
     if from_env:
         return Path(from_env).expanduser().resolve()
 
-    return (Path(__file__).resolve().parents[1] / "service-account.json").resolve()
+    return (Path(__file__).resolve().parents[1] / "oauth-secret.json").resolve()
+
+
+def resolve_oauth_token_path() -> Path:
+    from_env = os.getenv("GOOGLE_OAUTH_TOKEN_PATH", "").strip()
+    if from_env:
+        return Path(from_env).expanduser().resolve()
+
+    return (Path(__file__).resolve().parents[1] / "token.json").resolve()
+
+
+def get_drive_credentials() -> Credentials:
+    token_path = resolve_oauth_token_path()
+    client_secret_path = resolve_oauth_client_secret_path()
+
+    credentials: Credentials | None = None
+    login_reason = "token_missing"
+
+    if token_path.is_file():
+        log("drive_oauth_token_load_start", token_file=str(token_path))
+        try:
+            credentials = Credentials.from_authorized_user_file(str(token_path), DRIVE_SCOPES)
+            has_required_scopes = credentials.has_scopes(DRIVE_SCOPES)
+
+            log(
+                "drive_oauth_token_load_complete",
+                token_file=str(token_path),
+                valid=bool(credentials.valid),
+                expired=bool(credentials.expired),
+                has_refresh_token=bool(credentials.refresh_token),
+                has_required_scopes=has_required_scopes,
+            )
+
+            if not has_required_scopes:
+                credentials = None
+                login_reason = "token_missing_required_scope"
+            else:
+                login_reason = "token_invalid"
+        except Exception as exc:  # noqa: BLE001 - login fallback should still proceed
+            log_exception("drive_oauth_token_load_failed", exc, token_file=str(token_path))
+            credentials = None
+            login_reason = "token_unreadable"
+
+    if credentials and credentials.expired and credentials.refresh_token:
+        log("drive_oauth_token_refresh_start", token_file=str(token_path))
+        try:
+            credentials.refresh(Request())
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            token_path.write_text(credentials.to_json(), encoding="utf-8")
+            log("drive_oauth_token_refresh_complete", token_file=str(token_path))
+        except Exception as exc:  # noqa: BLE001 - login fallback should still proceed
+            log_exception("drive_oauth_token_refresh_failed", exc, token_file=str(token_path))
+            credentials = None
+            login_reason = "token_refresh_failed"
+
+    if credentials and credentials.valid:
+        log("drive_oauth_credentials_ready", source="token", token_file=str(token_path))
+        return credentials
+
+    if not client_secret_path.is_file():
+        raise FileNotFoundError(f"OAuth client secret file not found: {client_secret_path}")
+
+    log(
+        "drive_oauth_browser_login_required",
+        reason=login_reason,
+        client_secret_file=str(client_secret_path),
+        token_file=str(token_path),
+    )
+    flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), DRIVE_SCOPES)
+
+    # Explicitly log when the worker is waiting for user browser consent.
+    log("drive_oauth_browser_login_waiting", local_server_port=0)
+    credentials = flow.run_local_server(port=0)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(credentials.to_json(), encoding="utf-8")
+    log("drive_oauth_browser_login_complete", token_file=str(token_path))
+    return credentials
 
 
 def upload_to_drive(output_dir: Path, job_id: str) -> str:
@@ -625,14 +703,7 @@ def upload_to_drive(output_dir: Path, job_id: str) -> str:
     if not target_folder_id:
         raise RuntimeError("DRIVE_TARGET_FOLDER_ID is required for Drive upload")
 
-    credentials_path = resolve_service_account_path()
-    if not credentials_path.is_file():
-        raise FileNotFoundError(f"service account file not found: {credentials_path}")
-
-    credentials = service_account.Credentials.from_service_account_file(
-        str(credentials_path),
-        scopes=DRIVE_SCOPES,
-    )
+    credentials = get_drive_credentials()
     drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
 
     target_folder = (
@@ -660,14 +731,8 @@ def upload_to_drive(output_dir: Path, job_id: str) -> str:
 
     if not can_add_children:
         raise RuntimeError(
-            f"service account cannot add files to DRIVE_TARGET_FOLDER_ID={target_folder_id} "
+            f"OAuth user cannot add files to DRIVE_TARGET_FOLDER_ID={target_folder_id} "
             f"({target_folder_name or 'unknown_name'})"
-        )
-
-    if not target_drive_id:
-        raise RuntimeError(
-            "DRIVE_TARGET_FOLDER_ID must point to a Shared Drive folder for service-account uploads; "
-            "current folder has no driveId (My Drive), which triggers storageQuotaExceeded"
         )
 
     folder_metadata = {
