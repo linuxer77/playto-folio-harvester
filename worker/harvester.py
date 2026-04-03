@@ -36,6 +36,7 @@ VIDEO_HOST_PATTERN = re.compile(r"(youtube\.com|youtu\.be|vimeo\.com)", re.IGNOR
 DIRECT_VIDEO_PATTERN = re.compile(r"\.(mp4|m4v|mov|webm)(?:$|\?|#)", re.IGNORECASE)
 DRIVE_FILE_PATTERN = re.compile(r"drive\.google\.com/file/d/", re.IGNORECASE)
 VIDEO_FILE_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi"}
+STREAM_VIDEO_PATTERN = re.compile(r"\.m3u8(?:$|\?|#)", re.IGNORECASE)
 MIN_IMAGE_DIMENSION = 250
 MAX_VIDEO_HEIGHT = 1080
 MAX_VIDEO_FILESIZE_BYTES = 200 * 1024 * 1024
@@ -91,7 +92,11 @@ def is_pdf_url(url: str) -> bool:
 
 def is_video_candidate(url: str) -> bool:
     lowered = url.lower()
-    return bool(VIDEO_HOST_PATTERN.search(lowered) or DIRECT_VIDEO_PATTERN.search(lowered))
+    return bool(
+        VIDEO_HOST_PATTERN.search(lowered)
+        or DIRECT_VIDEO_PATTERN.search(lowered)
+        or STREAM_VIDEO_PATTERN.search(lowered)
+    )
 
 
 def normalize_drive_file_url(url: str) -> str | None:
@@ -174,18 +179,16 @@ async def ensure_fully_rendered(page: Page, url: str) -> None:
     log("navigation_complete", final_url=page.url)
 
 
-async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str]]:
+async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str], list[str]]:
     dom_snapshot = await page.evaluate(
         r"""
         () => {
             const values = {
                 images: new Set(),
                 links: new Set(),
-                iframes: new Set(),
-                videos: new Set(),
                 driveLinks: new Set(),
-                driveIframes: new Set(),
                 skippedLogoImages: [],
+                candidates: [],
             };
 
             const push = (targetSet, raw) => {
@@ -241,29 +244,36 @@ async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str]]:
                 }
             });
 
-            document.querySelectorAll("iframe[src]").forEach((frame) => {
-                const src = frame.getAttribute("src");
-                push(values.iframes, src);
-                if (isDriveFileLink(src)) {
-                    push(values.driveIframes, src);
+            let candidateCounter = 0;
+            document.querySelectorAll("*").forEach((el) => {
+                const style = window.getComputedStyle(el);
+                if (!style || style.opacity === "0" || style.display === "none" || style.visibility === "hidden") {
+                    return;
                 }
-            });
-
-            document.querySelectorAll("video").forEach((video) => {
-                push(values.videos, video.getAttribute("src"));
-                video.querySelectorAll("source[src]").forEach((source) => {
-                    push(values.videos, source.getAttribute("src"));
-                });
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 150 || rect.height <= 100) {
+                    return;
+                }
+                const isClickable = (style.cursor === "pointer") || ["a", "button"].includes(el.tagName.toLowerCase());
+                if (!isClickable) {
+                    return;
+                }
+                const hasImgOrBg = el.querySelector("img") !== null || (style.backgroundImage && style.backgroundImage !== "none");
+                if (!hasImgOrBg) {
+                    return;
+                }
+                
+                const uid = "h-" + (++candidateCounter);
+                el.setAttribute("data-heuristic-id", uid);
+                values.candidates.push(uid);
             });
 
             return {
                 images: [...values.images],
                 links: [...values.links],
-                iframes: [...values.iframes],
-                videos: [...values.videos],
                 drive_links: [...values.driveLinks],
-                drive_iframes: [...values.driveIframes],
                 skipped_logo_images: values.skippedLogoImages,
+                candidates: values.candidates,
             };
         }
         """
@@ -298,16 +308,6 @@ async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str]]:
         if is_video_candidate(normalized):
             video_urls.add(normalized)
 
-    for raw in dom_snapshot.get("iframes", []):
-        normalized = normalize_url(base_url, raw)
-        if normalized and is_video_candidate(normalized):
-            video_urls.add(normalized)
-
-    for raw in dom_snapshot.get("videos", []):
-        normalized = normalize_url(base_url, raw)
-        if normalized and is_video_candidate(normalized):
-            video_urls.add(normalized)
-
     for raw in dom_snapshot.get("drive_links", []):
         normalized = normalize_url(base_url, raw)
         if not normalized:
@@ -320,25 +320,16 @@ async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str]]:
         video_urls.add(drive_url)
         log("drive_link_detected", source=drive_url)
 
-    for raw in dom_snapshot.get("drive_iframes", []):
-        normalized = normalize_url(base_url, raw)
-        if not normalized:
-            continue
-
-        drive_url = normalize_drive_file_url(normalized)
-        if not drive_url:
-            continue
-
-        video_urls.add(drive_url)
-        log("drive_iframe_detected", source=drive_url)
+    candidates = dom_snapshot.get("candidates", [])
 
     log(
         "media_discovered",
         image_candidates=len(image_urls),
         pdf_candidates=len(pdf_urls),
         video_candidates=len(video_urls),
+        heuristic_candidates=len(candidates),
     )
-    return image_urls, pdf_urls, video_urls
+    return image_urls, pdf_urls, video_urls, candidates
 
 
 async def download_url(
@@ -813,11 +804,44 @@ async def run_harvest(url: str, output_dir: Path, job_id: str) -> None:
         context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1600, "height": 900})
         page = await context.new_page()
 
+        intercepted_video_urls: set[str] = set()
+
+        def handle_response(response) -> None:
+            url = response.url
+            if is_video_candidate(url):
+                intercepted_video_urls.add(url)
+            else:
+                drive_url = normalize_drive_file_url(url)
+                if drive_url:
+                    intercepted_video_urls.add(drive_url)
+
+        page.on("response", handle_response)
+
         try:
             await ensure_fully_rendered(page, url)
-            image_urls, pdf_urls, video_urls = await extract_media_urls(page)
+            image_urls, pdf_urls, embedded_video_urls, candidates = await extract_media_urls(page)
+
+            log("heuristic_discovery_start", total_candidates=len(candidates))
+            for uid in candidates:
+                locator = page.locator(f'[data-heuristic-id="{uid}"]')
+                try:
+                    if await locator.is_visible():
+                        await locator.click(timeout=3_000)
+                        await page.wait_for_timeout(1_500)
+                        await page.keyboard.press("Escape")
+                except Exception as exc:  # noqa: BLE001
+                    log("heuristic_trigger_error", candidate=uid, error=str(exc))
+                    try:
+                        await page.go_back(wait_until="networkidle", timeout=10_000)
+                    except Exception:  # noqa: BLE001
+                        pass
+            
+            # Merge embedded links with newly intercepted ones
+            all_video_urls = embedded_video_urls.union(intercepted_video_urls)
+            log("network_interception_summary", intercepted=len(intercepted_video_urls), total_videos=len(all_video_urls))
+
             image_files, doc_files = await download_assets(image_urls, pdf_urls, output_dir)
-            video_files, fallback_entries, fallback_images = await extract_videos(page, video_urls, output_dir)
+            video_files, fallback_entries, fallback_images = await extract_videos(page, all_video_urls, output_dir)
             image_files.extend(fallback_images)
         except PlaywrightTimeoutError as exc:
             log_exception("navigation_timeout", exc, current_url=page.url)
