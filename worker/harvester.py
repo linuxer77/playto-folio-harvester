@@ -37,6 +37,13 @@ DIRECT_VIDEO_PATTERN = re.compile(r"\.(mp4|m4v|mov|webm)(?:$|\?|#)", re.IGNORECA
 DRIVE_FILE_PATTERN = re.compile(r"drive\.google\.com/file/d/", re.IGNORECASE)
 VIDEO_FILE_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi"}
 STREAM_VIDEO_PATTERN = re.compile(r"\.m3u8(?:$|\?|#)", re.IGNORECASE)
+
+MEDIA_PATTERNS = [
+    VIDEO_HOST_PATTERN,
+    DIRECT_VIDEO_PATTERN,
+    STREAM_VIDEO_PATTERN,
+]
+
 MIN_IMAGE_DIMENSION = 250
 MAX_VIDEO_HEIGHT = 1080
 MAX_VIDEO_FILESIZE_BYTES = 200 * 1024 * 1024
@@ -92,11 +99,7 @@ def is_pdf_url(url: str) -> bool:
 
 def is_video_candidate(url: str) -> bool:
     lowered = url.lower()
-    return bool(
-        VIDEO_HOST_PATTERN.search(lowered)
-        or DIRECT_VIDEO_PATTERN.search(lowered)
-        or STREAM_VIDEO_PATTERN.search(lowered)
-    )
+    return any(pat.search(lowered) for pat in MEDIA_PATTERNS)
 
 
 def normalize_drive_file_url(url: str) -> str | None:
@@ -423,7 +426,7 @@ def _download_video_sync(video_url: str, output_dir: Path, ordinal: int) -> list
         "format": (
             f"bestvideo*[height<={MAX_VIDEO_HEIGHT}]"
             f"+bestaudio/best[height<={MAX_VIDEO_HEIGHT}]"
-            f"/best[height<={MAX_VIDEO_HEIGHT}]"
+            f"/best[height<={MAX_VIDEO_HEIGHT}]/best"
         ),
         "merge_output_format": "mp4",
         "max_filesize": MAX_VIDEO_FILESIZE_BYTES,
@@ -503,18 +506,46 @@ async def extract_videos(
     fallback_images: list[Path] = []
 
     for index, video_url in enumerate(sorted(set(video_urls)), start=1):
+        parsed = urlparse(video_url)
+        clean_name = unquote(parsed.path.split('/')[-1])
+        clean_name = "".join(c for c in clean_name if c.isalnum() or c in "-_.")
+        if not clean_name:
+            clean_name = f"video_{index:03d}"
+        
+        info_txt_path = output_dir / f"{clean_name}.txt"
+        try:
+            info_txt_path.write_text(f"{video_url}\n", encoding="utf-8")
+        except BaseException:
+            pass
+
+        if "youtube.com" in parsed.netloc.lower():
+            path_lower = parsed.path.lower()
+            if not path_lower or path_lower == "/" or any(path_lower.startswith(p) for p in ("/@", "/c/", "/channel/", "/user/")):
+                log("video_ignored_channel", source=video_url, reason="soft check matched channel/user path")
+                continue
+
         log("video_download_start", source=video_url)
         try:
             downloaded = await asyncio.to_thread(_download_video_sync, video_url, output_dir, index)
             video_files.extend(downloaded)
             log("video_download_complete", source=video_url, files=[path.name for path in downloaded])
         except DownloadError as exc:
+            exc_str = str(exc).lower()
+            if any(kw in exc_str for kw in ("unsupported url", "playlist", "channel", "user", "not a video")):
+                log("video_ignored_not_a_video", source=video_url, reason=str(exc))
+                continue
+
             log("video_download_failed", source=video_url, error_type=type(exc).__name__, error=str(exc))
             screenshot = await capture_video_fallback_screenshot(page, output_dir, index)
             if screenshot:
                 fallback_images.append(screenshot)
             fallbacks.append(FallbackEntry(source_url=video_url, reason=str(exc), screenshot_path=screenshot))
         except Exception as exc:  # noqa: BLE001 - must degrade gracefully
+            exc_str = str(exc).lower()
+            if any(kw in exc_str for kw in ("unsupported url", "playlist", "channel", "user", "not a video")):
+                log("video_ignored_not_a_video", source=video_url, reason=str(exc))
+                continue
+
             log("video_download_failed", source=video_url, error_type=type(exc).__name__, error=str(exc))
             screenshot = await capture_video_fallback_screenshot(page, output_dir, index)
             if screenshot:
@@ -822,20 +853,45 @@ async def run_harvest(url: str, output_dir: Path, job_id: str) -> None:
             image_urls, pdf_urls, embedded_video_urls, candidates = await extract_media_urls(page)
 
             log("heuristic_discovery_start", total_candidates=len(candidates))
-            for uid in candidates:
+            total = len(candidates)
+            for index, uid in enumerate(candidates, start=1):
+                print(f"[LOOP] Processing candidate {index}/{total}: {uid}")
                 locator = page.locator(f'[data-heuristic-id="{uid}"]')
                 try:
-                    if await locator.is_visible():
-                        await locator.click(timeout=3_000)
-                        await page.wait_for_timeout(1_500)
-                        await page.keyboard.press("Escape")
+                    is_visible = await locator.is_visible()
+                    print(f"[LOOP] Candidate {uid} visibility: {is_visible}")
+                    if is_visible:
+                        print(f"[LOOP] Attempting click on {uid}...")
+                        try:
+                            await locator.click(timeout=5000, force=True)
+                            print(f"[LOOP] Click successful. Waiting for network...")
+                            await page.wait_for_timeout(1_500)
+                        except PlaywrightTimeoutError as timeout_exc:
+                            # Bypass minor intercepted clicks
+                            print(f"[ERROR] Timeout/Intercepted click on {uid}: {timeout_exc}")
+                            continue
+
+                        try:
+                            print(f"[LOOP] Dismissing modal (Escape)...")
+                            await page.keyboard.press("Escape")
+                            await page.wait_for_timeout(500)
+                            
+                            print(f"[LOOP] Fallback modal dismiss (Click 5,5)...")
+                            await page.mouse.click(5, 5)
+                            await page.wait_for_timeout(500)
+                        except Exception as escape_exc:
+                            # Bubble this up to the Nuclear Option
+                            raise RuntimeError(f"Modal dismissal error: {escape_exc}") from escape_exc
+
                 except Exception as exc:  # noqa: BLE001
+                    print(f"[ERROR] {exc}")
                     log("heuristic_trigger_error", candidate=uid, error=str(exc))
                     try:
-                        await page.go_back(wait_until="networkidle", timeout=10_000)
-                    except Exception:  # noqa: BLE001
-                        pass
-            
+                        print(f"[LOOP] Nuclear Option: Forcing page reload to unblock DOM...")
+                        await page.reload(wait_until="networkidle", timeout=15_000)
+                    except Exception as reload_exc:  # noqa: BLE001
+                        print(f"[ERROR] Reload failed: {reload_exc}")
+
             # Merge embedded links with newly intercepted ones
             all_video_urls = embedded_video_urls.union(intercepted_video_urls)
             log("network_interception_summary", intercepted=len(intercepted_video_urls), total_videos=len(all_video_urls))
