@@ -42,6 +42,7 @@ MEDIA_PATTERNS = [
     VIDEO_HOST_PATTERN,
     DIRECT_VIDEO_PATTERN,
     STREAM_VIDEO_PATTERN,
+    re.compile(r"instagram\.com/(?:p|reel)/"),
 ]
 
 MIN_IMAGE_DIMENSION = 250
@@ -206,6 +207,8 @@ async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str], 
 
             const hasLogoKeyword = (raw) => typeof raw === "string" && /(logo|icon|favicon)/i.test(raw);
             const isDriveFileLink = (raw) => typeof raw === "string" && /drive\.google\.com\/file\/d\//i.test(raw);
+            const mediaHrefPattern = /(youtube\.com|youtu\.be|vimeo\.com|instagram\.com\/(?:p|reel)\/|\.m3u8(?:$|\?|#)|\.(mp4|m4v|mov|webm)(?:$|\?|#))/i;
+            const isMediaHref = (raw) => typeof raw === "string" && mediaHrefPattern.test(raw.trim());
 
             document.querySelectorAll("img").forEach((img) => {
                 const candidateSources = new Set();
@@ -263,6 +266,17 @@ async def extract_media_urls(page: Page) -> tuple[set[str], set[str], set[str], 
                 }
                 const hasImgOrBg = el.querySelector("img") !== null || (style.backgroundImage && style.backgroundImage !== "none");
                 if (!hasImgOrBg) {
+                    return;
+                }
+
+                const anchors = el.tagName.toLowerCase() === "a"
+                    ? [el]
+                    : Array.from(el.querySelectorAll("a[href]"));
+                const linksToDirectMedia = anchors.some((anchor) => {
+                    const href = anchor.getAttribute("href") || anchor.href || "";
+                    return isMediaHref(href);
+                });
+                if (linksToDirectMedia) {
                     return;
                 }
                 
@@ -850,6 +864,26 @@ async def run_harvest(url: str, output_dir: Path, job_id: str) -> None:
 
         try:
             await ensure_fully_rendered(page, url)
+
+            static_href_matches = await page.evaluate(
+                r"""
+                () => {
+                    const mediaHrefPattern = /(youtube\.com|youtu\.be|vimeo\.com|instagram\.com\/(?:p|reel)\/|\.m3u8(?:$|\?|#)|\.(mp4|m4v|mov|webm)(?:$|\?|#))/i;
+                    return Array.from(document.querySelectorAll("a[href]"))
+                        .map((anchor) => anchor.getAttribute("href"))
+                        .filter((href) => typeof href === "string" && mediaHrefPattern.test(href.trim()));
+                }
+                """
+            )
+
+            discovered_videos: set[str] = set()
+            for raw in static_href_matches:
+                normalized = normalize_url(page.url, raw)
+                if normalized and is_video_candidate(normalized):
+                    discovered_videos.add(normalized)
+
+            print(f"[STATIC] Found {len(discovered_videos)} direct media links in hrefs.")
+
             image_urls, pdf_urls, embedded_video_urls, candidates = await extract_media_urls(page)
 
             log("heuristic_discovery_start", total_candidates=len(candidates))
@@ -893,7 +927,7 @@ async def run_harvest(url: str, output_dir: Path, job_id: str) -> None:
                         print(f"[ERROR] Reload failed: {reload_exc}")
 
             # Merge embedded links with newly intercepted ones
-            all_video_urls = embedded_video_urls.union(intercepted_video_urls)
+            all_video_urls = embedded_video_urls.union(intercepted_video_urls).union(discovered_videos)
             log("network_interception_summary", intercepted=len(intercepted_video_urls), total_videos=len(all_video_urls))
 
             image_files, doc_files = await download_assets(image_urls, pdf_urls, output_dir)
