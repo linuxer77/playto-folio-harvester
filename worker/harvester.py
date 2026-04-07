@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse
 
 import aiohttp
 from google.auth.transport.requests import Request
@@ -33,7 +33,7 @@ USER_AGENT = (
     "Chrome/123.0.0.0 Safari/537.36"
 )
 VIDEO_HOST_PATTERN = re.compile(r"(youtube\.com|youtu\.be|vimeo\.com)", re.IGNORECASE)
-DIRECT_VIDEO_PATTERN = re.compile(r"\.(mp4|m4v|mov|webm)(?:$|\?|#)", re.IGNORECASE)
+DIRECT_VIDEO_PATTERN = re.compile(r"\.(mp4|webm|m3u8|m4v|mov)(?:[\?#].*)?$", re.IGNORECASE)
 DRIVE_FILE_PATTERN = re.compile(r"drive\.google\.com/file/d/", re.IGNORECASE)
 VIDEO_FILE_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi"}
 STREAM_VIDEO_PATTERN = re.compile(r"\.m3u8(?:$|\?|#)", re.IGNORECASE)
@@ -48,6 +48,7 @@ MEDIA_PATTERNS = [
 MIN_IMAGE_DIMENSION = 250
 MAX_VIDEO_HEIGHT = 1080
 MAX_VIDEO_FILESIZE_BYTES = 200 * 1024 * 1024
+VIDEO_DOWNLOAD_TIMEOUT_SECONDS = 180
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
@@ -103,6 +104,68 @@ def is_video_candidate(url: str) -> bool:
     return any(pat.search(lowered) for pat in MEDIA_PATTERNS)
 
 
+def is_probable_video_response(url: str, content_type: str, resource_type: str) -> bool:
+    lowered_url = url.lower()
+    lowered_content_type = content_type.lower()
+    lowered_resource_type = resource_type.lower()
+
+    if is_video_candidate(url):
+        return True
+    if lowered_resource_type == "media":
+        return True
+    if "video/" in lowered_content_type:
+        return True
+    if any(
+        hint in lowered_content_type
+        for hint in (
+            "application/vnd.apple.mpegurl",
+            "application/x-mpegurl",
+            "application/dash+xml",
+        )
+    ):
+        return True
+    if any(
+        hint in lowered_url
+        for hint in (
+            ".mpd",
+            "format=mp4",
+            "mime=video",
+            "contenttype=video",
+        )
+    ):
+        return True
+    return False
+
+
+def canonicalize_video_request_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.query:
+        return parsed._replace(fragment="").geturl()
+
+    volatile_query_params = {
+        "range",
+        "start",
+        "end",
+        "bytestart",
+        "byteend",
+        "rn",
+        "rbuf",
+    }
+
+    retained_pairs = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in volatile_query_params
+    ]
+    canonical_query = urlencode(retained_pairs, doseq=True)
+    return parsed._replace(query=canonical_query, fragment="").geturl()
+
+
+def is_unusable_segment_url(url: str) -> bool:
+    lowered = url.lower()
+    return any(token in lowered for token in (".m4s", ".ts?", "/chunk/", "segment="))
+
+
 def normalize_drive_file_url(url: str) -> str | None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
@@ -155,31 +218,152 @@ def infer_extension(url: str, content_type: str, default_ext: str) -> str:
 
 async def ensure_fully_rendered(page: Page, url: str) -> None:
     log("navigation_start", url=url)
-    await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-
     try:
-        await page.wait_for_load_state("networkidle", timeout=45_000)
+        await page.goto(url, wait_until="networkidle", timeout=90_000)
     except PlaywrightTimeoutError:
         # Some sites keep long-lived background requests open indefinitely.
         log(
             "navigation_networkidle_timeout",
-            timeout_ms=45_000,
+            timeout_ms=90_000,
             current_url=page.url,
         )
         await page.wait_for_selector("body", state="attached", timeout=10_000)
         await page.wait_for_timeout(1_500)
 
-    # Scroll to trigger lazy-loaded images/videos on modern portfolio pages.
-    for _ in range(8):
-        current_height = await page.evaluate("() => document.body.scrollHeight")
-        await page.evaluate("height => window.scrollTo(0, height)", current_height)
-        await page.wait_for_timeout(650)
-        next_height = await page.evaluate("() => document.body.scrollHeight")
-        if next_height <= current_height:
+    print("[PRE-FLIGHT] Starting incremental scroll sweep to trigger lazy-loaded media...")
+    max_scroll_steps = 60
+    steps_taken = 0
+    reached_bottom = False
+    last_scroller = ""
+    for _ in range(max_scroll_steps):
+        steps_taken += 1
+        step_state = await page.evaluate(
+            """
+            () => {
+                const docScroller = document.scrollingElement || document.documentElement;
+                const windowViewport = window.innerHeight || document.documentElement.clientHeight || 900;
+                const windowTop = window.scrollY || window.pageYOffset || docScroller.scrollTop || 0;
+                const documentHeight = Math.max(
+                    document.body.scrollHeight,
+                    document.documentElement.scrollHeight,
+                    docScroller.scrollHeight || 0
+                );
+                const windowCanScroll = documentHeight > windowViewport + 2;
+
+                let target = null;
+                let targetKind = "none";
+
+                if (windowCanScroll) {
+                    target = docScroller;
+                    targetKind = "window";
+                } else {
+                    const candidates = Array.from(document.querySelectorAll("main, [role='main'], [data-scroll], [class*='scroll'], div, section"));
+                    let best = null;
+                    let bestDelta = 0;
+
+                    for (const candidate of candidates) {
+                        if (!(candidate instanceof HTMLElement)) {
+                            continue;
+                        }
+                        const style = window.getComputedStyle(candidate);
+                        const overflowY = style.overflowY || "";
+                        if (!["auto", "scroll", "overlay"].includes(overflowY)) {
+                            continue;
+                        }
+
+                        const delta = candidate.scrollHeight - candidate.clientHeight;
+                        if (delta > bestDelta && candidate.clientHeight > 120) {
+                            bestDelta = delta;
+                            best = candidate;
+                        }
+                    }
+
+                    if (best) {
+                        target = best;
+                        targetKind = "element";
+                    }
+                }
+
+                if (!target) {
+                    return {
+                        reachedBottom: true,
+                        moved: false,
+                        scroller: "none",
+                        top: 0,
+                        total: 0,
+                    };
+                }
+
+                if (targetKind === "window") {
+                    const currentTop = windowTop;
+                    const alreadyAtBottom = currentTop + windowViewport >= documentHeight - 2;
+                    if (!alreadyAtBottom) {
+                        window.scrollBy(0, windowViewport);
+                    }
+                    const nextTop = window.scrollY || window.pageYOffset || docScroller.scrollTop || 0;
+                    const refreshedDocumentHeight = Math.max(
+                        document.body.scrollHeight,
+                        document.documentElement.scrollHeight,
+                        docScroller.scrollHeight || 0
+                    );
+
+                    return {
+                        reachedBottom: nextTop + windowViewport >= refreshedDocumentHeight - 2,
+                        moved: nextTop > currentTop,
+                        scroller: "window",
+                        top: nextTop,
+                        total: refreshedDocumentHeight,
+                    };
+                }
+
+                const element = target;
+                const viewportHeight = element.clientHeight;
+                const currentTop = element.scrollTop;
+                const totalHeight = element.scrollHeight;
+                const alreadyAtBottom = currentTop + viewportHeight >= totalHeight - 2;
+                if (!alreadyAtBottom) {
+                    element.scrollTop = Math.min(totalHeight, currentTop + viewportHeight);
+                }
+                const nextTop = element.scrollTop;
+                const refreshedTotalHeight = element.scrollHeight;
+                const classSummary = (element.className || "").toString().trim().split(/\\s+/).slice(0, 2).join(".");
+                const scrollerName = `${element.tagName.toLowerCase()}${element.id ? '#' + element.id : ''}${classSummary ? '.' + classSummary : ''}`;
+
+                return {
+                    reachedBottom: nextTop + viewportHeight >= refreshedTotalHeight - 2,
+                    moved: nextTop > currentTop,
+                    scroller: scrollerName,
+                    top: nextTop,
+                    total: refreshedTotalHeight,
+                };
+            }
+            """
+        )
+
+        scroller_name = step_state.get("scroller", "") if isinstance(step_state, dict) else ""
+        if scroller_name and scroller_name != last_scroller:
+            print(f"[PRE-FLIGHT] Active scroller: {scroller_name}")
+            last_scroller = scroller_name
+
+        reached_bottom = bool(step_state.get("reachedBottom", False)) if isinstance(step_state, dict) else False
+        await page.wait_for_timeout(1_500)
+        if reached_bottom:
             break
 
-    await page.evaluate("() => window.scrollTo(0, 0)")
-    await page.wait_for_timeout(500)
+    await page.evaluate(
+        """
+        () => {
+            window.scrollTo(0, 0);
+            document.querySelectorAll("*").forEach((el) => {
+                if (el instanceof HTMLElement && el.scrollTop > 0) {
+                    el.scrollTop = 0;
+                }
+            });
+        }
+        """
+    )
+    print("[PRE-FLIGHT] Scroll sweep complete.")
+    log("preflight_scroll_summary", steps_taken=steps_taken, max_steps=max_scroll_steps, reached_bottom=reached_bottom)
     log("navigation_complete", final_url=page.url)
 
 
@@ -422,6 +606,107 @@ async def download_assets(
     return image_files, doc_files
 
 
+async def download_direct_video_url(page: Page, video_url: str, output_dir: Path, ordinal: int) -> Path | None:
+    browser_headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "video/*,*/*;q=0.9",
+        "Referer": page.url,
+    }
+
+    try:
+        browser_response = await page.context.request.get(
+            video_url,
+            fail_on_status_code=False,
+            timeout=120_000,
+            headers=browser_headers,
+        )
+        if browser_response.status in {200, 206}:
+            browser_content_type = browser_response.headers.get("content-type", "")
+            normalized_browser_content_type = browser_content_type.split(";", maxsplit=1)[0].strip().lower()
+            if not normalized_browser_content_type or normalized_browser_content_type.startswith("video/"):
+                length_header = browser_response.headers.get("content-length", "").strip()
+                if length_header.isdigit() and int(length_header) > MAX_VIDEO_FILESIZE_BYTES:
+                    log(
+                        "video_direct_download_skipped",
+                        source=video_url,
+                        reason="content_length_exceeded",
+                        content_length=int(length_header),
+                    )
+                else:
+                    body = await browser_response.body()
+                    if body and len(body) <= MAX_VIDEO_FILESIZE_BYTES:
+                        extension = infer_extension(video_url, browser_content_type, ".mp4")
+                        destination = output_dir / f"raw_video_{ordinal:03d}_direct{extension}"
+                        with destination.open("wb") as file_handle:
+                            file_handle.write(body)
+
+                        if destination.suffix.lower() in VIDEO_FILE_EXTENSIONS:
+                            return destination
+
+                        destination.unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001 - continue to aiohttp fallback
+        log(
+            "video_direct_download_browser_error",
+            source=video_url,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+
+    timeout = aiohttp.ClientTimeout(total=180)
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "video/*,*/*;q=0.9",
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(video_url, allow_redirects=True) as response:
+                if response.status not in {200, 206}:
+                    log("video_direct_download_skipped", source=video_url, status=response.status)
+                    return None
+
+                content_type = response.headers.get("Content-Type", "")
+                normalized_content_type = content_type.split(";", maxsplit=1)[0].strip().lower()
+                if normalized_content_type and not (
+                    normalized_content_type.startswith("video/")
+                    or normalized_content_type in {
+                        "application/vnd.apple.mpegurl",
+                        "application/x-mpegurl",
+                        "application/dash+xml",
+                        "application/octet-stream",
+                    }
+                ):
+                    log(
+                        "video_direct_download_skipped",
+                        source=video_url,
+                        reason="content_type_not_video",
+                        content_type=normalized_content_type,
+                    )
+                    return None
+
+                extension = infer_extension(video_url, content_type, ".mp4")
+                destination = output_dir / f"raw_video_{ordinal:03d}_direct{extension}"
+
+                with destination.open("wb") as file_handle:
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        file_handle.write(chunk)
+
+                if destination.suffix.lower() not in VIDEO_FILE_EXTENSIONS:
+                    destination.unlink(missing_ok=True)
+                    log(
+                        "video_direct_download_skipped",
+                        source=video_url,
+                        reason="unsupported_extension",
+                        extension=extension,
+                    )
+                    return None
+
+                return destination
+    except Exception as exc:  # noqa: BLE001 - direct fallback should never crash worker
+        log("video_direct_download_error", source=video_url, error_type=type(exc).__name__, error=str(exc))
+        return None
+
+
 def _download_video_sync(video_url: str, output_dir: Path, ordinal: int) -> list[Path]:
     prefix = f"raw_video_{ordinal:03d}"
     template = str(output_dir / f"{prefix}.%(ext)s")
@@ -519,7 +804,19 @@ async def extract_videos(
     fallbacks: list[FallbackEntry] = []
     fallback_images: list[Path] = []
 
-    for index, video_url in enumerate(sorted(set(video_urls)), start=1):
+    def video_download_sort_key(candidate_url: str) -> tuple[int, int, str]:
+        parsed_candidate = urlparse(candidate_url)
+        host = parsed_candidate.netloc.lower()
+        extension = Path(unquote(parsed_candidate.path)).suffix.lower()
+        is_youtube = "youtube.com" in host or "youtu.be" in host
+        is_direct_file = extension in VIDEO_FILE_EXTENSIONS
+
+        # Prioritize direct hosted files first; process YouTube links last.
+        return (1 if is_youtube else 0, 0 if is_direct_file else 1, candidate_url)
+
+    ordered_video_urls = sorted(set(video_urls), key=video_download_sort_key)
+
+    for index, video_url in enumerate(ordered_video_urls, start=1):
         parsed = urlparse(video_url)
         clean_name = unquote(parsed.path.split('/')[-1])
         clean_name = "".join(c for c in clean_name if c.isalnum() or c in "-_.")
@@ -539,15 +836,51 @@ async def extract_videos(
                 continue
 
         log("video_download_start", source=video_url)
+
+        direct_extension = Path(unquote(parsed.path)).suffix.lower()
+        if direct_extension in VIDEO_FILE_EXTENSIONS:
+            direct_file = await download_direct_video_url(page, video_url, output_dir, index)
+            if direct_file:
+                video_files.append(direct_file)
+                log("video_download_complete_direct", source=video_url, file=direct_file.name)
+                continue
+
         try:
-            downloaded = await asyncio.to_thread(_download_video_sync, video_url, output_dir, index)
+            downloaded = await asyncio.wait_for(
+                asyncio.to_thread(_download_video_sync, video_url, output_dir, index),
+                timeout=VIDEO_DOWNLOAD_TIMEOUT_SECONDS,
+            )
             video_files.extend(downloaded)
             log("video_download_complete", source=video_url, files=[path.name for path in downloaded])
+        except asyncio.TimeoutError:
+            log("video_download_timeout", source=video_url, timeout_sec=VIDEO_DOWNLOAD_TIMEOUT_SECONDS)
+
+            for partial in output_dir.glob(f"raw_video_{index:03d}*"):
+                if partial.suffix.lower() in {".part", ".ytdl", ".temp"}:
+                    partial.unlink(missing_ok=True)
+
+            direct_file = await download_direct_video_url(page, video_url, output_dir, index)
+            if direct_file:
+                video_files.append(direct_file)
+                log("video_download_complete_direct", source=video_url, file=direct_file.name)
+                continue
+
+            screenshot = await capture_video_fallback_screenshot(page, output_dir, index)
+            if screenshot:
+                fallback_images.append(screenshot)
+            fallbacks.append(FallbackEntry(source_url=video_url, reason="video_download_timeout", screenshot_path=screenshot))
         except DownloadError as exc:
             exc_str = str(exc).lower()
-            if any(kw in exc_str for kw in ("unsupported url", "playlist", "channel", "user", "not a video")):
+            if any(kw in exc_str for kw in ("playlist", "channel", "user", "not a video")):
                 log("video_ignored_not_a_video", source=video_url, reason=str(exc))
                 continue
+
+            if "unsupported url" in exc_str:
+                direct_file = await download_direct_video_url(page, video_url, output_dir, index)
+                if direct_file:
+                    video_files.append(direct_file)
+                    log("video_download_complete_direct", source=video_url, file=direct_file.name)
+                    continue
 
             log("video_download_failed", source=video_url, error_type=type(exc).__name__, error=str(exc))
             screenshot = await capture_video_fallback_screenshot(page, output_dir, index)
@@ -556,9 +889,16 @@ async def extract_videos(
             fallbacks.append(FallbackEntry(source_url=video_url, reason=str(exc), screenshot_path=screenshot))
         except Exception as exc:  # noqa: BLE001 - must degrade gracefully
             exc_str = str(exc).lower()
-            if any(kw in exc_str for kw in ("unsupported url", "playlist", "channel", "user", "not a video")):
+            if any(kw in exc_str for kw in ("playlist", "channel", "user", "not a video")):
                 log("video_ignored_not_a_video", source=video_url, reason=str(exc))
                 continue
+
+            if "unsupported url" in exc_str:
+                direct_file = await download_direct_video_url(page, video_url, output_dir, index)
+                if direct_file:
+                    video_files.append(direct_file)
+                    log("video_download_complete_direct", source=video_url, file=direct_file.name)
+                    continue
 
             log("video_download_failed", source=video_url, error_type=type(exc).__name__, error=str(exc))
             screenshot = await capture_video_fallback_screenshot(page, output_dir, index)
@@ -852,11 +1192,20 @@ async def run_harvest(url: str, output_dir: Path, job_id: str) -> None:
         intercepted_video_urls: set[str] = set()
 
         def handle_response(response) -> None:
-            url = response.url
-            if is_video_candidate(url):
-                intercepted_video_urls.add(url)
+            req_url = response.url
+            req_url_lower = req_url.lower()
+            if "canva" in req_url_lower or "video" in req_url_lower or "mp4" in req_url_lower:
+                print(f"[X-RAY NETWORK] Caught potential media request: {req_url}")
+
+            content_type = response.headers.get("content-type", "")
+            resource_type = response.request.resource_type
+
+            if is_probable_video_response(req_url, content_type, resource_type):
+                canonical_url = canonicalize_video_request_url(req_url)
+                if not is_unusable_segment_url(canonical_url):
+                    intercepted_video_urls.add(canonical_url)
             else:
-                drive_url = normalize_drive_file_url(url)
+                drive_url = normalize_drive_file_url(req_url)
                 if drive_url:
                     intercepted_video_urls.add(drive_url)
 
@@ -864,6 +1213,51 @@ async def run_harvest(url: str, output_dir: Path, job_id: str) -> None:
 
         try:
             await ensure_fully_rendered(page, url)
+
+            discovered_videos: set[str] = set()
+            autoplay_dom_video_sources = await page.evaluate(
+                r"""
+                () => {
+                    const found = new Set();
+                    const looksLikeVideo = (raw) => {
+                        if (typeof raw !== "string") {
+                            return false;
+                        }
+                        const value = raw.trim().toLowerCase();
+                        if (!value || value.startsWith("blob:") || value.startsWith("data:")) {
+                            return false;
+                        }
+                        return value.includes(".mp4")
+                            || value.includes(".webm")
+                            || value.includes(".m3u8")
+                            || value.includes("mime=video")
+                            || value.includes("format=mp4")
+                            || value.includes("/video/");
+                    };
+
+                    document.querySelectorAll("video").forEach((video) => {
+                        const videoSrc = video.getAttribute("src") || video.currentSrc || "";
+                        if (looksLikeVideo(videoSrc)) {
+                            found.add(videoSrc.trim());
+                        }
+
+                        video.querySelectorAll("source[src]").forEach((source) => {
+                            const sourceSrc = source.getAttribute("src") || "";
+                            if (looksLikeVideo(sourceSrc)) {
+                                found.add(sourceSrc.trim());
+                            }
+                        });
+                    });
+                    return [...found].filter(Boolean);
+                }
+                """
+            )
+            for raw in autoplay_dom_video_sources:
+                normalized = normalize_url(page.url, raw)
+                if normalized:
+                    discovered_videos.add(normalized)
+
+            print(f"[AUTOPLAY] Manually scraped {len(autoplay_dom_video_sources)} video source URLs from the DOM.")
 
             static_href_matches = await page.evaluate(
                 r"""
@@ -876,7 +1270,6 @@ async def run_harvest(url: str, output_dir: Path, job_id: str) -> None:
                 """
             )
 
-            discovered_videos: set[str] = set()
             for raw in static_href_matches:
                 normalized = normalize_url(page.url, raw)
                 if normalized and is_video_candidate(normalized):
@@ -899,7 +1292,20 @@ async def run_harvest(url: str, output_dir: Path, job_id: str) -> None:
                         try:
                             await locator.click(timeout=5000, force=True)
                             print(f"[LOOP] Click successful. Waiting for network...")
-                            await page.wait_for_timeout(1_500)
+                            await page.wait_for_timeout(1_000)
+
+                            print(f"[LOOP] Modal opened. Scanning for secondary Play overlay...")
+                            try:
+                                play_button = page.locator("iframe, [aria-label*='play' i], [class*='play' i], [class*='Play' i]").first
+                                if await play_button.is_visible():
+                                    print(f"[LOOP] Secondary Play button found! Attempting click...")
+                                    await play_button.click(timeout=3000, force=True)
+                                    print(f"[LOOP] Secondary click successful. Waiting for network...")
+                                    await page.wait_for_timeout(1_500)
+                                else:
+                                    print(f"[LOOP] No secondary Play button detected, or click failed. Proceeding to close modal.")
+                            except Exception:
+                                print(f"[LOOP] No secondary Play button detected, or click failed. Proceeding to close modal.")
                         except PlaywrightTimeoutError as timeout_exc:
                             # Bypass minor intercepted clicks
                             print(f"[ERROR] Timeout/Intercepted click on {uid}: {timeout_exc}")
