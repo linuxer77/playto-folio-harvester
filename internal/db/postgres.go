@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -26,17 +27,51 @@ func NewPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 		cfg.ConnConfig.User,
 	)
 
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("create pool: %w", err)
-	}
+	const (
+		maxAttempts   = 30
+		retryInterval = 2 * time.Second
+		pingTimeout   = 5 * time.Second
+	)
 
-	if err := pool.Ping(ctx); err != nil {
+	var lastPingErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		pool, err := pgxpool.NewWithConfig(ctx, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("create pool: %w", err)
+		}
+
+		pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+		pingErr := pool.Ping(pingCtx)
+		cancel()
+
+		if pingErr == nil {
+			log.Printf("db_connect_success host=%s port=%d database=%s", cfg.ConnConfig.Host, cfg.ConnConfig.Port, cfg.ConnConfig.Database)
+			return pool, nil
+		}
+
 		pool.Close()
-		return nil, fmt.Errorf("ping database: %w", err)
+		lastPingErr = pingErr
+
+		if attempt == maxAttempts {
+			break
+		}
+
+		log.Printf(
+			"db_connect_retry attempt=%d max=%d wait_seconds=%d error=%q",
+			attempt,
+			maxAttempts,
+			int(retryInterval.Seconds()),
+			pingErr,
+		)
+
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("ping database canceled: %w", ctx.Err())
+		case <-timer.C:
+		}
 	}
 
-	log.Printf("db_connect_success host=%s port=%d database=%s", cfg.ConnConfig.Host, cfg.ConnConfig.Port, cfg.ConnConfig.Database)
-
-	return pool, nil
+	return nil, fmt.Errorf("ping database: %w", lastPingErr)
 }

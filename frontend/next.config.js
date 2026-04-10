@@ -1,10 +1,12 @@
 /** @type {import("next").NextConfig} */
+const backendInternalUrl = process.env.BACKEND_INTERNAL_URL || "http://localhost:8080"
+
 const nextConfig = {
   async rewrites() {
     return [
       {
         source: "/api/:path*",
-        destination: "http://localhost:8080/api/:path*",
+        destination: `${backendInternalUrl}/api/:path*`,
       },
     ]
   },

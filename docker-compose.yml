@@ -1,0 +1,55 @@
+services:
+  db:
+    image: postgres:16-bookworm
+    container_name: playto-db
+    environment:
+      POSTGRES_DB: playto_harvester
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d playto_harvester"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: playto-backend
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://postgres:postgres@db:5432/playto_harvester?sslmode=disable
+      PYTHON_BIN: python3
+      WORKER_SCRIPT_PATH: /app/worker/harvester.py
+      HARVEST_OUTPUT_BASE: /app/temp_harvest
+      DRIVE_TARGET_FOLDER_ID: ${DRIVE_TARGET_FOLDER_ID:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - harvest_output:/app/temp_harvest
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: playto-frontend
+    depends_on:
+      - backend
+    environment:
+      BACKEND_INTERNAL_URL: http://backend:8080
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
+  harvest_output:

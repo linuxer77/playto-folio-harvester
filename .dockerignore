@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+temp_harvest
+
+frontend/node_modules
+frontend/.next
+
+oauth-secret.json
+oauth-secret-mine.json
+token.json
+
+*.log
