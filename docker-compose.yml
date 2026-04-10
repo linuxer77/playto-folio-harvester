@@ -33,12 +33,13 @@ services:
       HARVEST_OUTPUT_BASE: /app/temp_harvest
       GOOGLE_OAUTH_CLIENT_SECRET: /app/oauth-secret.json
       GOOGLE_OAUTH_TOKEN_PATH: /app/token.json
+      GOOGLE_OAUTH_ALLOW_BROWSER_LOGIN: "false"
       DRIVE_TARGET_FOLDER_ID: ${DRIVE_TARGET_FOLDER_ID:-}
     ports:
       - "8080:8080"
     volumes:
       - harvest_output:/app/temp_harvest
-      - ${GOOGLE_OAUTH_CLIENT_SECRET_FILE:-./oauth-secret.json}:/app/oauth-secret.json:ro
+      - ${GOOGLE_OAUTH_CLIENT_SECRET_FILE:-./auth-secret.json}:/app/oauth-secret.json:ro
       - ${GOOGLE_OAUTH_TOKEN_FILE:-./token.json}:/app/token.json
 
   frontend:

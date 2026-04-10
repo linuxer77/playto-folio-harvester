@@ -1604,9 +1604,22 @@ def resolve_oauth_token_path() -> Path:
     return (Path(__file__).resolve().parents[1] / "token.json").resolve()
 
 
+def env_flag_enabled(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    normalized = raw.strip().lower()
+    if normalized == "":
+        return default
+
+    return normalized in {"1", "true", "yes", "on"}
+
+
 def get_drive_credentials() -> Credentials:
     token_path = resolve_oauth_token_path()
     client_secret_path = resolve_oauth_client_secret_path()
+    allow_browser_login = env_flag_enabled("GOOGLE_OAUTH_ALLOW_BROWSER_LOGIN", True)
 
     credentials: Credentials | None = None
     login_reason = "token_missing"
@@ -1652,6 +1665,18 @@ def get_drive_credentials() -> Credentials:
         log("drive_oauth_credentials_ready", source="token", token_file=str(token_path))
         return credentials
 
+    if not allow_browser_login:
+        log(
+            "drive_oauth_browser_login_disabled",
+            reason=login_reason,
+            token_file=str(token_path),
+            client_secret_file=str(client_secret_path),
+        )
+        raise RuntimeError(
+            "Google Drive OAuth token is missing/invalid and browser login is disabled. "
+            f"Refresh token at {token_path} on host, then restart backend."
+        )
+
     if not client_secret_path.is_file():
         raise FileNotFoundError(f"OAuth client secret file not found: {client_secret_path}")
 
@@ -1661,7 +1686,15 @@ def get_drive_credentials() -> Credentials:
         client_secret_file=str(client_secret_path),
         token_file=str(token_path),
     )
-    flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), DRIVE_SCOPES)
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), DRIVE_SCOPES)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "OAuth client secret file is not valid JSON: "
+            f"{client_secret_path}. Set GOOGLE_OAUTH_CLIENT_SECRET to a valid Desktop OAuth file."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - rethrow with path context for faster debugging
+        raise RuntimeError(f"Failed to load OAuth client secret file {client_secret_path}: {exc}") from exc
 
     # Explicitly log when the worker is waiting for user browser consent.
     log("drive_oauth_browser_login_waiting", local_server_port=0)
