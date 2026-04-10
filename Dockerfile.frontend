@@ -1,7 +1,10 @@
 FROM node:20-bookworm-slim
 WORKDIR /app/frontend
 
+ARG BACKEND_INTERNAL_URL=http://backend:8080
+
 ENV NEXT_TELEMETRY_DISABLED=1
+ENV BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL}
 
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
