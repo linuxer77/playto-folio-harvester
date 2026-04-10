@@ -38,19 +38,35 @@ func main() {
 	pythonExecutable := envOrDefault("PYTHON_BIN", "python")
 	workerScriptPath := envOrDefault("WORKER_SCRIPT_PATH", "worker/harvester.py")
 	outputBaseDir := envOrDefault("HARVEST_OUTPUT_BASE", "./temp_harvest")
+	oauthClientSecretPath := envOrDefault("GOOGLE_OAUTH_CLIENT_SECRET", "auth-secret.json")
+	oauthTokenPath := envOrDefault("GOOGLE_OAUTH_TOKEN_PATH", "token.json")
+	oauthRedirectURL := envOrDefault("GOOGLE_OAUTH_REDIRECT_URL", "http://localhost:3000/api/auth/google/callback")
 
 	resolvedWorkerScriptPath, err := filepath.Abs(workerScriptPath)
 	if err != nil {
 		log.Fatalf("resolve worker script path: %v", err)
 	}
 
+	resolvedOAuthClientSecretPath, err := filepath.Abs(oauthClientSecretPath)
+	if err != nil {
+		log.Fatalf("resolve oauth client secret path: %v", err)
+	}
+
+	resolvedOAuthTokenPath, err := filepath.Abs(oauthTokenPath)
+	if err != nil {
+		log.Fatalf("resolve oauth token path: %v", err)
+	}
+
 	log.Printf(
-		"service_starting port=%s python_bin=%q worker_script=%q output_base=%q database=%s",
+		"service_starting port=%s python_bin=%q worker_script=%q output_base=%q database=%s oauth_client_secret=%q oauth_token_path=%q oauth_redirect_url=%q",
 		port,
 		pythonExecutable,
 		resolvedWorkerScriptPath,
 		filepath.Clean(outputBaseDir),
 		redactDatabaseURL(databaseURL),
+		resolvedOAuthClientSecretPath,
+		resolvedOAuthTokenPath,
+		oauthRedirectURL,
 	)
 
 	ctx := context.Background()
@@ -67,8 +83,13 @@ func main() {
 		resolvedWorkerScriptPath,
 		filepath.Clean(outputBaseDir),
 	)
+	googleAuthHandler := api.NewGoogleAuthHandler(
+		resolvedOAuthClientSecretPath,
+		resolvedOAuthTokenPath,
+		oauthRedirectURL,
+	)
 
-	router := api.NewRouter(api.NewJobHandler(jobsRepo, processor))
+	router := api.NewRouter(api.NewJobHandler(jobsRepo, processor), googleAuthHandler)
 	server := &http.Server{
 		Addr:              ":" + port,
 		Handler:           router,

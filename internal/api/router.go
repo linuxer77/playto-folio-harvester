@@ -8,7 +8,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-func NewRouter(jobHandler *JobHandler) http.Handler {
+func NewRouter(jobHandler *JobHandler, googleAuthHandler *GoogleAuthHandler) http.Handler {
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	router.Use(middleware.RealIP)
@@ -17,6 +17,9 @@ func NewRouter(jobHandler *JobHandler) http.Handler {
 	router.Use(middleware.Timeout(60 * time.Second))
 
 	jobHandler.RegisterRoutes(router)
+	if googleAuthHandler != nil {
+		googleAuthHandler.RegisterRoutes(router)
+	}
 
 	return router
 }
