@@ -12,12 +12,6 @@ import { type CreateJobPayload, type HarvestJob } from "@/types/job"
 const POLL_INTERVAL_MS = 3000
 const GOOGLE_AUTH_POPUP_FEATURES = "width=560,height=760,resizable=yes,scrollbars=yes"
 
-const TOKEN_ERROR_MARKERS = [
-  "google drive oauth token is missing/invalid",
-  "invalid_grant",
-  "token has been expired or revoked",
-]
-
 interface LoadJobsOptions {
   signal?: AbortSignal
   silent?: boolean
@@ -34,23 +28,12 @@ async function readErrorMessage(response: Response): Promise<string> {
   }
 }
 
-function isGoogleTokenFailure(job: HarvestJob): boolean {
-  if (job.status !== "failed" || !job.error_logs) {
-    return false
-  }
-
-  const lower = job.error_logs.toLowerCase()
-  return TOKEN_ERROR_MARKERS.some((marker) => lower.includes(marker))
-}
-
 export function JobsDashboard() {
   const [jobs, setJobs] = useState<HarvestJob[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isAuthorizingGoogle, setIsAuthorizingGoogle] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
-
-  const needsGoogleReconnect = jobs.some(isGoogleTokenFailure)
 
   const loadJobs = useCallback(async ({ signal, silent = false }: LoadJobsOptions = {}) => {
     try {
@@ -208,22 +191,20 @@ export function JobsDashboard() {
 
   return (
     <div className="space-y-6">
-      {needsGoogleReconnect ? (
-        <Card className="border-amber-300 bg-amber-50/90 ring-amber-300/40">
-          <CardHeader>
-            <CardTitle>Reconnect Google Drive</CardTitle>
-            <CardDescription>
-              A recent job failed because the Google token expired. Reconnect once, then retry.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-wrap items-center gap-3">
-            <Button onClick={reconnectGoogleDrive} disabled={isAuthorizingGoogle}>
-              {isAuthorizingGoogle ? "Waiting For Google Auth..." : "Open Google Auth"}
-            </Button>
-            <p className="text-sm text-slate-600">This opens a popup and saves token.json on the backend.</p>
-          </CardContent>
-        </Card>
-      ) : null}
+      <Card className="border-amber-300 bg-amber-50/90 ring-amber-300/40">
+        <CardHeader>
+          <CardTitle>Reconnect Google Drive</CardTitle>
+          <CardDescription>
+            Use this anytime to connect or refresh Google authorization.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-center gap-3">
+          <Button onClick={reconnectGoogleDrive} disabled={isAuthorizingGoogle}>
+            {isAuthorizingGoogle ? "Waiting For Google Auth..." : "Open Google Auth"}
+          </Button>
+          <p className="text-sm text-slate-600">This opens a popup and saves token.json on the backend.</p>
+        </CardContent>
+      </Card>
       <JobSubmissionForm isSubmitting={isSubmitting} onSubmit={createJob} />
       <JobsTable jobs={jobs} isLoading={isLoading} loadError={loadError} />
     </div>
